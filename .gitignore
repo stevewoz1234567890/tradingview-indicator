@@ -1,0 +1,6 @@
+# LibreOffice / Word locks
+.~lock*
+**/.~lock*
+
+# Local temp copies
+_mcm_copy.docx
