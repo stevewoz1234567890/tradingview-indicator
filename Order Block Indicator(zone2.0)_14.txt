@@ -1,8 +1,10 @@
 //@version=5
-indicator("Order Block Indicator V1.4.2 (Multi Clean + HTF touch alerts)", overlay=true, max_boxes_count=500, max_labels_count=500)
+// Order blocks: BOS-driven zones via General (straight/swing/sweep), Clean, Multi-Clean, and Break markers.
+// Includes wick rules, distance filter, mitigation, optional HTF touch alerts.
+indicator("Order Block Indicator V1.4.26 (Multi Clean + HTF touch alerts)", overlay=true, max_boxes_count=500, max_labels_count=500, max_bars_back=500)
 
 //────────────────────────────────────────
-// ENUM STATE MACHINE
+// ENUMS & STATE TYPES — machine states for general OB, clean/multi-clean, break-marker slots
 //────────────────────────────────────────
 maxBMSeq = 15
 
@@ -29,7 +31,7 @@ enum BreakState
     
 var bool[] wait_break_continue_bos = array.new_bool(2, false)
 
-//Break Marker state storage (multi sequence)
+// Break Marker — per-slot arrays (multi-sequence); COLLECT → WAIT_BREAK → box or reset
 var int bmSlots = 2 * maxBMSeq
 
 var bool[] bmLocked = array.new_bool(bmSlots, false)
@@ -52,7 +54,7 @@ if barstate.isfirst
         array.set(bmOBHigh, i, na)
         array.set(bmOBLow, i, na)
 
-//Clean Marker state storage (scalable)
+// Clean Marker — dual dir: SCANNING → WAIT_TAKE; CM extreme, break ref, impulse low/high
 var CleanState[] cmState = array.new<CleanState>(2)
 var float[] cmExtreme = array.new_float(2)   // high for bull, low for bear
 var float[] cmZoneLow = array.new_float(2)
@@ -61,6 +63,7 @@ var int[]   cmLeft = array.new_int(2)
 var bool[] cmExtremeTaken = array.new_bool(2, false)
 var float[] cmBreakRef = array.new_float(2)
 var float[] cmImpulse = array.new_float(2)
+var bool[] cmTouchAlertFired = array.new_bool(2, false)
 
 if barstate.isfirst
     array.set(cmImpulse, 0, na)
@@ -72,7 +75,7 @@ if barstate.isfirst
     array.set(cmBreakRef, 0, na)
     array.set(cmBreakRef, 1, na)
 
-// Multi Clean Marker state (parallel to Clean Marker; wider straight-candle detection)
+// Multi Clean Marker — same idea as Clean but most-recent pivot offset mo + pivot bar index
 var CleanState[] mcmState = array.new<CleanState>(2)
 var float[] mcmExtreme = array.new_float(2)
 var float[] mcmZoneLow = array.new_float(2)
@@ -81,6 +84,12 @@ var int[]   mcmLeft = array.new_int(2)
 var bool[] mcmExtremeTaken = array.new_bool(2, false)
 var float[] mcmBreakRef = array.new_float(2)
 var float[] mcmImpulse = array.new_float(2)
+var int[]   mcmPivotBar = array.new_int(2)
+var bool[] mcmTouchAlertFired = array.new_bool(2, false)
+var label[] mcmMapLblA = array.new<label>(2)
+var label[] mcmMapLblB = array.new<label>(2)
+var label[] mcmMapLblC = array.new<label>(2)
+var label[] mcmMapLblD = array.new<label>(2)
 
 if barstate.isfirst
     array.set(mcmImpulse, 0, na)
@@ -91,18 +100,20 @@ if barstate.isfirst
     array.set(mcmExtremeTaken, 1, false)
     array.set(mcmBreakRef, 0, na)
     array.set(mcmBreakRef, 1, na)
+    array.set(mcmPivotBar, 0, int(na))
+    array.set(mcmPivotBar, 1, int(na))
 
 var float bullImpulseLow = na
 var float bearImpulseHigh = na
 
 //────────────────────────────────────────
-// General Marker Distance Tracking
+// GENERAL MARKER EXTRAS — optional extremes for legacy distance / context (gm* vars)
 //────────────────────────────────────────
 var float gmLowestBearishLow = na
 var float gmHighestBullishHigh = na
 
 //────────────────────────────────────────
-// Inputs
+// INPUTS — show toggles, marker modes, lookbacks, colors, HTF alert TF
 //────────────────────────────────────────
 showBullishOB   = input.bool(true, "Show Bullish OB")
 showBearishOB   = input.bool(true, "Show Bearish OB")
@@ -112,44 +123,59 @@ maxTrackedOBs   = input.int(80, "Max Tracked OBs", minval=10, maxval=300)
 enableDistanceCheck = input.bool(true, "Enable Distance Check")
 maxDistancePips     = input.float(100.0, "Max Distance (pips)", minval=0)
 
-// Sweep validation
+// Marker mode toggles — General / Clean / Multi / Break + optional highlight labels
 showMarkerHighlight = input.bool(false, "Highlight Markers")
 useGeneralMarker       = input.bool(true, "Straight, Swing, Partial Marker")
 useCleanMarker       = input.bool(true, "Clean Marker")
-useMultiCleanMarker  = input.bool(true, "Multi Clean Marker")
+useMultiCleanMarker  = input.bool(true, "Multi Clean Marker", group="Multi clean", tooltip="NOT the same as Break marker. Multi clean arms only after BOS (bullBreak/bearBreak), then fractal + segment + take. A “Break marker” label does not by itself start Multi clean.")
+mcmStrictMode        = input.bool(false, "Strict: + sweep OB extreme before break; + same-dir touch cancels WAIT", group="Multi clean")
+showMultiCleanMapLabels = input.bool(false, "Show (A–D) letters while Multi clean WAIT", tooltip="Off by default so boxes stay visible. Turn on to map A/B/C/D in code.", group="Multi clean")
+mcmPreferConfirmFirst = input.bool(true, "Prefer pivot that confirms first", tooltip="Among valid fractals, choose the one whose take level (close through ref) is crossed earliest in time. Off = nearest pivot (smallest mo), previous behavior.", group="Multi clean")
+mcmSkipInvalidCandleRule = input.bool(true, "Multi clean: skip INV (invalid-candle) filter", tooltip="When on, Multi clean does not reject setups when the first bar after the 3-bar pattern is opposite color (matches more manual zones). Clean marker still uses INV.", group="Multi clean")
 useBreakMarker = input.bool(true, "Break Marker")
 
-//Mitigation
+// Clean / Multi pivot: optional “all bull/bear after last opposite” filter (off = candle-2 can be bear like your fractal-high example)
+requireImpulseAfterOpp = input.bool(false, "Clean/Multi: impulse-only bars after last opposite")
+
+// Mitigation — delete vs fade when zone is traded through
 deleteMitigatedBoxes = input.bool(false, "Delete Mitigated OBs")
 fadeMitigated        = input.bool(true, "Fade Mitigated OBs")
 
-// Zone touch alerts (evaluated per completed candle of selected timeframe)
+// HTF touch alert — completed HTF candle range vs stored zones
 alertOnZoneTouchHTF  = input.bool(false, "Alert: zone touched (HTF candle)")
 zoneTouchTimeframe   = input.timeframe("15", "Zone touch alert timeframe")
 
-// Marker validation
+// Lookback — straight/swing marker search + PB bars
 useStraightMarker   = input.bool(true, "Straight Marker (lookback)")
 useSwingMarker      = input.bool(true, "Swing Marker (lookback)")
 requireBothMarkers  = input.bool(false, "Require Both Markers")
-markerLookback      = input.int(80, "Marker Lookback (bars)", minval=3, maxval=200)
+markerLookback      = input.int(120, "Marker Lookback (bars)", minval=3, maxval=200, tooltip="Higher = search further back for fractals (helps monthly / long history).")
 pbLookback      = input.int(20, "PB Lookback (bars)", minval=3, maxval=200)
 
-// Wick-rule zone
+// Wick rule — trim zone to body when wick clears next bar
 useWickRule     = input.bool(true, "Use Wick Rule for OB Zone")
 
-// Visuals
+// Colors — bull/bear fill, border, mitigated
 bullFill   = input.color(color.new(color.blue, 77), "Bull Fill")
 bearFill   = input.color(color.new(color.red, 77),  "Bear Fill")
 bullBorder = input.color(color.new(color.blue, 40), "Bull Border")
 bearBorder = input.color(color.new(color.red, 40),  "Bear Border")
 mitBorder  = input.color(color.new(color.green, 0), "Mitigated Border")
 
-// Optional labels
+// Zone labels — region name centered on top edge of each OB box
+showBoxRegionLabels = input.bool(false, "Region name on zone (top of box)", tooltip="Off = boxes only, easier to see price.")
+
+// Debug — optional state labels on chart
 showDebugLabels = input.bool(false, "Debug Labels")
 debugStartDate       = timestamp("2026-03-02 21:00")//input.time(timestamp("2026-02-19 11:00"), "Debug Start Date/Time")
 debugEndDate         = timestamp("2026-03-02 22:30")//input.time(timestamp("2026-02-19 24:00"), "Debug End Date/Time")
 
-// === Pip Size Calculation ===
+// On-chart legend — region names + one-line behavior (not code comments)
+showRegionGuidePanel = input.bool(false, "Show region guide panel", group="Region guide", tooltip="Off by default so chart stays clean. Turn on for the legend table.")
+regionGuidePosition  = input.string("Top right", "Panel corner", options=["Top right", "Top left", "Bottom right", "Bottom left"], group="Region guide")
+regionGuideTextSize  = input.string("Small", "Panel text size", options=["Tiny", "Small", "Normal"], group="Region guide")
+
+// === Pip size — forex/JPY/XAU vs mintick; feeds maxDistance in price units ===
 var float pipSize = 0.0
 // JPY pairs: pip = 0.01 (second decimal place)
 //   If mintick = 0.001 (3 decimals), then pipSize = 0.01 = mintick * 10
@@ -168,7 +194,7 @@ else
 maxDistance = maxDistancePips * pipSize
 
 //────────────────────────────────────────
-// Helpers
+// HELPERS — bull/bear/neutral, distance gate f_distanceOk
 //────────────────────────────────────────
 isBull = close >= open
 isBear = close < open
@@ -179,9 +205,19 @@ isStrictBear = close < open
 f_distanceOk(_ref, _curr) =>
     not enableDistanceCheck or (not na(_ref) and math.abs(_ref - _curr) <= maxDistance)
 
+f_regionGuidePos(_s) =>
+    _s == "Top left" ? position.top_left : _s == "Bottom right" ? position.bottom_right : _s == "Bottom left" ? position.bottom_left : position.top_right
+
+f_regionGuideSize(_s) =>
+    _s == "Tiny" ? size.tiny : _s == "Normal" ? size.normal : size.small
+
+// Centered on top of box (x = mid bar index, y = top price); style_label_up keeps text above the zone
+f_boxRegionLabel(_left, _right, _topPrice, _name, _bgTint) =>
+    if showBoxRegionLabels
+        label.new(int(math.round((_left + _right) / 2)), _topPrice, _name, style = label.style_label_up, color = _bgTint, textcolor = color.white, size = showMarkerHighlight ? size.normal : size.small)
+
 //────────────────────────────────────────
-// Marker Detection (Lookback, bounded)
-// Much closer to your v1.2 behavior than fixed 3-bar.
+// GENERAL MARKER LOOKBACK — f_markerBull/BearLookback: straight chain + optional swing V inside markerLookback
 //────────────────────────────────────────
 f_markerBullLookback() =>
     // Straight: Bull -> Bear(s) -> Bull within lookback
@@ -252,8 +288,11 @@ f_markerBearLookback() =>
     requireBothMarkers ? (straightOK and swingOK) : (straightOK or swingOK or (not useStraightMarker and not useSwingMarker))
 
 f_cleanStraightBull() =>
-    isStrictBull[2] and isStrictBull[1] and isStrictBull[0] and high[1] > high[2] and high[1] > high[0]
+    high[1] > high[2] and high[1] > high[0]
 
+//────────────────────────────────────────
+// CLEAN / MULTI-CLEAN HELPERS — impulse-only segment, opposite before pivot, straight pivot search, impulse fold
+//────────────────────────────────────────
 // Multi clean: entire segment after opposite bar must be impulse-only; straight = local high/low peak on 3 bars (mo = offset of straight candle from current bar).
 f_allImpulseBarsSince(dir, lastOppBarIdx) =>
     bool ok = true
@@ -262,7 +301,7 @@ f_allImpulseBarsSince(dir, lastOppBarIdx) =>
     else
         for bi = lastOppBarIdx + 1 to bar_index
             off = bar_index - bi
-            if off < 0 or off > 10000
+            if off < 0 or off > bar_index
                 ok := false
                 break
             if dir == 1 and not isBull[off]
@@ -273,32 +312,106 @@ f_allImpulseBarsSince(dir, lastOppBarIdx) =>
                 break
     ok
 
-// Multi clean straight: middle bar's high (bull) / low (bear) strictly higher/lower than immediate neighbors; all three bars strictly impulse (no doji) — matches "tallest by high" 3-candle pattern, no bearish in pattern.
-// Picks earliest straight in time (largest mo) when multiple qualify.
-f_findMultiStraightOffset(dir, lastOppBar) =>
+// Nearest opposite-direction bar *older* than straightBarIdx (for zone left). Bull → bear; bear → bull.
+f_lastOppBarBefore(dir, straightBarIdx) =>
+    int res = int(na)
+    if not na(straightBarIdx) and straightBarIdx > 0
+        for step = 1 to markerLookback
+            int bi = straightBarIdx - step
+            if bi < 0
+                break
+            int off = bar_index - bi
+            if off < 0 or off > bar_index
+                break
+            bool oppB = dir == 1 ? isBear[off] : isBull[off]
+            if oppB
+                res := bi
+                break
+    res
+
+// Multi clean / Clean: 3-bar pivot on highs/lows — middle candle (“candle 2”) can be any color; only wick extreme vs neighbors matters. Nearest match (smallest mo) breaks first.
+f_findMultiStraightOffset(dir) =>
     int result = int(na)
-    if not na(lastOppBar) and lastOppBar < bar_index - 1 and f_allImpulseBarsSince(dir, lastOppBar)
-        int maxMo = math.min(markerLookback, bar_index - lastOppBar - 1)
-        maxMo := math.min(maxMo, bar_index - 1)
-        if maxMo >= 1
-            for j = 0 to maxMo - 1
-                int mo = maxMo - j
-                if bar_index - mo <= lastOppBar
-                    continue
-                bool pat = false
-                if dir == 1
-                    pat := high[mo] > high[mo + 1] and high[mo] > high[mo - 1] and isStrictBull[mo] and isStrictBull[mo + 1] and isStrictBull[mo - 1]
-                else
-                    pat := low[mo] < low[mo + 1] and low[mo] < low[mo - 1] and isStrictBear[mo] and isStrictBear[mo + 1] and isStrictBear[mo - 1]
-                if pat
-                    result := mo
-                    break
+    int maxMo = math.min(markerLookback, bar_index - 1)
+    if maxMo >= 1
+        for mo = 1 to maxMo
+            bool pat = false
+            if dir == 1
+                pat := high[mo] > high[mo + 1] and high[mo] > high[mo - 1]
+            else
+                pat := low[mo] < low[mo + 1] and low[mo] < low[mo - 1]
+            if pat
+                result := mo
+                break
     result
 
+// Lowest low from straight candle (offset strOff) through current bar (incl. bars between straight and now).
+f_minLowStraightToNow(strOff) =>
+    float m = low[strOff]
+    if strOff >= 1
+        for k = 0 to strOff - 1
+            m := math.min(m, low[k])
+    m
+
+// Highest high from straight candle through current bar (bear multi clean).
+f_maxHighStraightToNow(strOff) =>
+    float m = high[strOff]
+    if strOff >= 1
+        for k = 0 to strOff - 1
+            m := math.max(m, high[k])
+    m
+
+// Candle 3 is at [mo-1]; first bar to its right is [mo-2]. If that bar is opposite color (bear after bull fractal / bull after bear fractal), setup is invalid.
+f_pivotAfterC3Ok(dir, mo) =>
+    mo < 2 ? true : (dir == 1 ? not isBear[mo - 2] : not isBull[mo - 2])
+
+// Multi clean only — can skip INV filter via input (Clean marker always uses f_pivotAfterC3Ok)
+f_mcmPivotAfterOk(dir, mo) =>
+    mcmSkipInvalidCandleRule ? true : f_pivotAfterC3Ok(dir, mo)
+
+// First bar after pivot (chronological: off mo-1, mo-2, … 0) where close takes ref (same test as mcleanBreak close vs break ref).
+f_mcmFirstConfirmOff(dir, mo, ref) =>
+    int res = int(na)
+    if mo >= 1
+        for step = 0 to mo - 1
+            int off = mo - 1 - step
+            bool taken = dir == 1 ? close[off] > ref : close[off] < ref
+            if taken
+                res := off
+                break
+    res
+
+// Multi clean: among pivots passing segment + pivotAfterC3, pick mo whose take ref is crossed earliest (min bar_index). If none crossed yet, fallback = nearest valid pivot (smallest mo).
+f_findMultiStraightOffsetConfirmFirst(dir) =>
+    int bestMo = int(na)
+    int bestBar = int(na)
+    int fallbackMo = int(na)
+    int maxMo = math.min(markerLookback, bar_index - 1)
+    if maxMo >= 1
+        for mo = 1 to maxMo
+            bool pat = false
+            if dir == 1
+                pat := high[mo] > high[mo + 1] and high[mo] > high[mo - 1]
+            else
+                pat := low[mo] < low[mo + 1] and low[mo] < low[mo - 1]
+            if pat
+                int straightBar = bar_index - mo
+                int lastOppM = f_lastOppBarBefore(dir, straightBar)
+                bool mcmSegmentOk = not na(lastOppM) and (not requireImpulseAfterOpp or f_allImpulseBarsSince(dir, lastOppM))
+                if mcmSegmentOk and f_mcmPivotAfterOk(dir, mo)
+                    if na(fallbackMo)
+                        fallbackMo := mo
+                    float ref = dir == 1 ? high[mo] : low[mo]
+                    int fcOff = f_mcmFirstConfirmOff(dir, mo, ref)
+                    if not na(fcOff)
+                        int cBar = bar_index - fcOff
+                        if na(bestBar) or cBar < bestBar or (cBar == bestBar and (na(bestMo) or mo < bestMo))
+                            bestBar := cBar
+                            bestMo := mo
+    not na(bestMo) ? bestMo : fallbackMo
+
 //────────────────────────────────────────
-// Partial Break checks (bounded, publish-safe)
-// PB Bull: after confirm, find bear group then bull breaks above bear high
-// PB Bear: after confirm, find bull group then bear breaks below bull low
+// PARTIAL BREAK (PB) — after sweep confirm bar, detect partial break via opposite cluster + reclaim
 //────────────────────────────────────────
 f_pbBull(confirmBarIndex) =>
     bool pb = false
@@ -337,7 +450,7 @@ f_pbBear(confirmBarIndex) =>
     pb
 
 //────────────────────────────────────────
-// OB storage (bounded arrays)
+// OB STORAGE — drawn boxes + parallel tops/bots/dirs; f_pruneOldest optional cap
 //────────────────────────────────────────
 var box[]   obBoxes = array.new_box()
 var float[] obTops  = array.new_float()
@@ -352,7 +465,7 @@ f_pruneOldest() =>
         array.shift(obDirs)
 
 //────────────────────────────────────────
-// Events (non-sticky)
+// EVENT FLAGS — one-shot per bar for alertcondition (confirm / mitigate)
 //────────────────────────────────────────
 bullConfirmed = false
 bearConfirmed = false
@@ -360,7 +473,7 @@ bullMitigated = false
 bearMitigated = false
 
 //────────────────────────────────────────
-// Track last bull/bear candle (most recent)
+// LAST OPPOSITE CANDLE — rolling last bear/bull bar & OHLC for BOS and wick-adjusted break tests
 //────────────────────────────────────────
 var float lastBearHigh = na
 var float lastBearLow  = na
@@ -383,6 +496,9 @@ if isBull or isNeutral
     lastBullOpen := open
     lastBullBar  := bar_index
 
+//────────────────────────────────────────
+// WICK RULES — cap OB zone when wick clears next bar; pivot variant uses body edge
+//────────────────────────────────────────
 f_applyWickRule(_top, _bot, _open, _nextHigh, _nextLow, _dir) =>
     float zTop = _top
     float zBot = _bot
@@ -395,17 +511,31 @@ f_applyWickRule(_top, _bot, _open, _nextHigh, _nextLow, _dir) =>
 
     [zTop, zBot]
 
-// Breaks
-// bullBreak = not na(lastBearHigh) and close > lastBearHigh
-// bearBreak = not na(lastBullLow) and close < lastBullLow
+// Pivot candle in 1–2–3 can be bullish or bearish; cap wick using true body edge (not raw open).
+f_applyPivotWickRule(_top, _bot, _open, _close, _nextHigh, _nextLow, _dir) =>
+    float bodyTop = math.max(_open, _close)
+    float bodyBot = math.min(_open, _close)
+    float zTop = _top
+    float zBot = _bot
+    if useWickRule
+        if _dir == 1 and _top > _nextHigh
+            zTop := bodyTop
+        if _dir == -1 and _bot < _nextLow
+            zBot := bodyBot
+    [zTop, zBot]
 
+//────────────────────────────────────────
+// BOS (break of structure) — close through wick-adjusted last opposite extreme
+//────────────────────────────────────────
 [adjBearHigh, _] = f_applyWickRule(lastBearHigh, lastBearLow, lastBearOpen, high, low, 1)
 [_, adjBullLow]  = f_applyWickRule(lastBullHigh, lastBullLow, lastBullOpen, high, low, -1)
 
 bullBreak = not na(adjBearHigh) and close > adjBearHigh
 bearBreak = not na(adjBullLow)  and close < adjBullLow
 
-//clean straight marker
+//────────────────────────────────────────
+// MARKER SHARED HELPERS — impulse/opposite, sweep test, last opposite index, same-dir touch cancel
+//────────────────────────────────────────
 f_isImpulse(dir) =>
     dir == 1 ? isBull : isBear
 
@@ -466,7 +596,7 @@ f_sameDirTouch(_dir, _top, _bot, obLeft, _isCleanMarkerWait) =>
                 contained or bullTouch or bearTouch or override or bullJump or bearJump
 
 //────────────────────────────────────────
-// BULLISH pipeline vars
+// GENERAL OB STATE VARS — bull: pending zone + confirm bar + sweep / PB
 //────────────────────────────────────────
 var float bullTop = na
 var float bullBot = na
@@ -476,7 +606,7 @@ var int   bullConfirmBar  = na
 var float bullExtraBearHigh = na
 
 //────────────────────────────────────────
-// BEARISH pipeline vars
+// GENERAL OB STATE VARS — bear: pending zone + confirm bar + sweep / PB
 //────────────────────────────────────────
 var float bearTop = na
 var float bearBot = na
@@ -486,9 +616,7 @@ var int   bearConfirmBar = na
 var float bearExtraBullLow = na
 
 //────────────────────────────────────────
-// Build OB zone with Wick Rule option
-// Bullish OB comes from last bearish candle before bull break
-// Bearish OB comes from last bullish candle before bear break
+// ZONE BUILD + LOOKUPS — f_calcBull/BearZone, duplicate left check, HTF overlap for alerts
 //────────────────────────────────────────
 f_calcBullZone(refOffset) =>
     float top = high[refOffset]
@@ -540,7 +668,9 @@ f_zonesTouchedInRange(_tops, _bots, _dirs, rh, rl) =>
                 hitBear := hitBear or zd == -1
     [hitBull, hitBear]
 
-// Updated OB and Clean Marker Logic with distinct OB start
+//────────────────────────────────────────
+// CLEAN MARKER PIPELINE — same fractal as Multi: search mo so “candle 2” stays the pivot on later bars until close breaks ref (fixed [1] was wrong on breakout bar)
+//────────────────────────────────────────
 for d = 0 to 1
     dir = d == 0 ? 1 : -1
 
@@ -549,44 +679,37 @@ for d = 0 to 1
     if startContext and array.get(cmState, d) == CleanState.IDLE
         array.set(cmState, d, CleanState.SCANNING)
 
-    lastOppBar = f_findLastOppositeBar(dir, markerLookback)
-
     if array.get(cmState, d) == CleanState.SCANNING
-        // Clean marker: strict 3-bar straight (high/low vs neighbors); from opposite bar to here, no bearish (bull) / no bullish (bear) — same as multi-clean segment rule
-        cleanStraight = (dir == 1 ? isStrictBull[2] and isStrictBull[1] and isStrictBull[0] : isStrictBear[2] and isStrictBear[1] and isStrictBear[0]) and (dir == 1 ? high[1] > high[2] and high[1] > high[0] : low[1] < low[2] and low[1] < low[0])
-        cleanAllBullBearOk = not na(lastOppBar) and f_allImpulseBarsSince(dir, lastOppBar)
+        moCl = f_findMultiStraightOffset(dir)
+        straightBarCl = not na(moCl) ? bar_index - moCl : na
+        lastOppCl = not na(straightBarCl) ? f_lastOppBarBefore(dir, straightBarCl) : na
+        cleanSegmentOk = not na(lastOppCl) and (not requireImpulseAfterOpp or f_allImpulseBarsSince(dir, lastOppCl))
 
         if f_isOpposite(dir)
             array.set(cmState, d, CleanState.IDLE)
+            array.set(cmTouchAlertFired, d, false)
         
-        else if bar_index >= 2 and cleanStraight and cleanAllBullBearOk
-            // Store straight marker reference for CLEAN break
+        else if not na(moCl) and cleanSegmentOk and f_pivotAfterC3Ok(dir, moCl)
             if dir == 1
-                array.set(cmBreakRef, d, high[1])   // straight bullish candle high
-                array.set(cmImpulse, d, low[1])     // start lowest tracking
+                array.set(cmBreakRef, d, high[moCl])
+                array.set(cmImpulse, d, f_minLowStraightToNow(moCl))
             else
-                array.set(cmBreakRef, d, low[1])    // straight bearish candle low
-                array.set(cmImpulse, d, high[1])    // start highest tracking
-            
-            if not na(lastOppBar)
-                offset = bar_index - lastOppBar
+                array.set(cmBreakRef, d, low[moCl])
+                array.set(cmImpulse, d, f_maxHighStraightToNow(moCl))
 
-                refHigh = high[offset]
-                refLow  = low[offset]
-                refOpen = open[offset]
+            float nHc = moCl > 0 ? high[moCl - 1] : na
+            float nLc = moCl > 0 ? low[moCl - 1] : na
+            // Pivot wick rule: if zone candle high > next candle high, top = body top (not raw open only — same as Multi / f_calc* zones)
+            [adjTopC, adjBotC] = f_applyPivotWickRule(high[moCl], low[moCl], open[moCl], close[moCl], nHc, nLc, dir)
 
-                // Apply General Marker Wick Rule immediately
-                [adjTop, adjBot] = f_applyWickRule(refHigh, refLow, refOpen, high[offset - 1], low[offset - 1], dir)
+            if dir == 1
+                array.set(cmExtreme, d, adjTopC)
+            else
+                array.set(cmExtreme, d, adjBotC)
 
-                if dir == 1
-                    array.set(cmExtreme, d, adjTop)   // bullish OB top
-                    array.set(cmZoneLow, d, adjBot)   // bullish OB bottom
-                else
-                    array.set(cmExtreme, d, adjBot)   // bearish OB bottom
-                    array.set(cmZoneHigh, d, adjTop)  // bearish OB top
-
-                array.set(cmLeft, d, lastOppBar)
-                array.set(cmState, d, CleanState.WAIT_TAKE)
+            array.set(cmLeft, d, lastOppCl)
+            array.set(cmTouchAlertFired, d, false)
+            array.set(cmState, d, CleanState.WAIT_TAKE)
                
     // WAIT_TAKE phase
     if array.get(cmState, d) == CleanState.WAIT_TAKE
@@ -595,64 +718,96 @@ for d = 0 to 1
             array.set(cmExtremeTaken, d, false)
             array.set(cmBreakRef, d, na)
             array.set(cmImpulse, d, na)
+            array.set(cmTouchAlertFired, d, false)
         else
-            zoneHigh = dir == 1 ? array.get(cmExtreme, d) : array.get(cmZoneHigh, d)
-            zoneLow  = dir == 1 ? array.get(cmZoneLow, d) : array.get(cmExtreme, d)
+            // Impulse extreme first — zone bounds depend on running min/max since pivot
+            imp = array.get(cmImpulse, d)
+
+            if dir == 1
+                imp := math.min(imp, low)
+            else
+                imp := math.max(imp, high)
+
+            array.set(cmImpulse, d, imp)
+
+            zoneHigh = dir == 1 ? array.get(cmExtreme, d) : array.get(cmImpulse, d)
+            zoneLow  = dir == 1 ? array.get(cmImpulse, d) : array.get(cmExtreme, d)
 
             if f_sameDirTouch(dir, zoneHigh, zoneLow, array.get(cmLeft, d), true)
                 array.set(cmState, d, CleanState.IDLE)
                 array.set(cmExtremeTaken, d, false)
                 array.set(cmBreakRef, d, na)
                 array.set(cmImpulse, d, na)
+                array.set(cmTouchAlertFired, d, false)
 
             else
-                // update impulse extreme
-                imp = array.get(cmImpulse, d)
+                brk = array.get(cmBreakRef, d)
+                ext = array.get(cmExtreme, d)
+                bool cmWickCapped = not na(brk) and not na(ext) and ((dir == 1 and ext < brk) or (dir == -1 and ext > brk))
+                bool zoneTouch = math.max(high, low) >= zoneLow and math.min(high, low) <= zoneHigh
+                if cmWickCapped and zoneTouch and barstate.isconfirmed and not array.get(cmTouchAlertFired, d)
+                    array.set(cmTouchAlertFired, d, true)
+                    if dir == 1
+                        bullConfirmed := true
+                    else
+                        bearConfirmed := true
 
-                if dir == 1
-                    imp := math.min(imp, low)
-                else
-                    imp := math.max(imp, high)
-
-                array.set(cmImpulse, d, imp)
-
-                // Arm the OB when extreme is taken
-                if not array.get(cmExtremeTaken, d) and f_extremeTaken(dir, array.get(cmExtreme, d))
-                    array.set(cmExtremeTaken, d, true)
-
-                // Straight level taken on a closed candle (close through ref), not wick-only
+                // Candle-2 level taken by *close* (confirmed bar), not wick-only
                 cleanBreak = barstate.isconfirmed and (dir == 1 ? close > array.get(cmBreakRef, d) : close < array.get(cmBreakRef, d))
 
-                if array.get(cmExtremeTaken, d) and cleanBreak
-                    rawTop = dir == 1 ? array.get(cmExtreme, d) : array.get(cmZoneHigh, d)
-                    rawBot = dir == 1 ? array.get(cmZoneLow, d) : array.get(cmExtreme, d)
+                if cleanBreak
+                    rawTop = dir == 1 ? array.get(cmExtreme, d) : array.get(cmImpulse, d)
+                    rawBot = dir == 1 ? array.get(cmImpulse, d) : array.get(cmExtreme, d)
 
-                    // APPLY GENERAL MARKER WICK RULE
-                    [zoneHigh, zoneLow] = f_applyWickRule(rawTop, rawBot, open, high, low, dir)
+                    [boxHi, boxLo] = f_applyWickRule(rawTop, rawBot, open, high, low, dir)
 
                     impulseExtreme = array.get(cmImpulse, d)
 
-                    if f_distanceOk(dir == 1 ? zoneHigh : zoneLow, impulseExtreme) and useCleanMarker and not f_boxLeftExists(array.get(cmLeft, d))
-                        if showMarkerHighlight
-                            label.new(bar_index - 1, dir == 1 ? zoneHigh : zoneLow, "Clean", style = dir == 1 ? label.style_label_down : label.style_label_up, color = dir == 1 ? color.new(color.blue, 77) : color.new(color.red, 77), textcolor = color.white, size = size.normal)
-                        bx = box.new( array.get(cmLeft, d), zoneHigh, bar_index, zoneLow, bgcolor = dir == 1 ? bullFill : bearFill, border_color = dir == 1 ? bullBorder : bearBorder )
+                    if f_distanceOk(dir == 1 ? boxHi : boxLo, impulseExtreme) and useCleanMarker and not f_boxLeftExists(array.get(cmLeft, d))
+                        bx = box.new( array.get(cmLeft, d), boxHi, bar_index, boxLo, bgcolor = dir == 1 ? bullFill : bearFill, border_color = dir == 1 ? bullBorder : bearBorder )
+                        f_boxRegionLabel(array.get(cmLeft, d), bar_index, boxHi, "Clean marker", dir == 1 ? color.new(color.blue, 78) : color.new(color.red, 78))
                         array.push(obBoxes, bx)
-                        array.push(obTops, zoneHigh)
-                        array.push(obBots, zoneLow)
+                        array.push(obTops, boxHi)
+                        array.push(obBots, boxLo)
                         array.push(obDirs, dir)
 
-                        if dir == 1
-                            bullConfirmed := true
-                        else
-                            bearConfirmed := true
+                        if not cmWickCapped
+                            if dir == 1
+                                bullConfirmed := true
+                            else
+                                bearConfirmed := true
 
                     // reset
                     array.set(cmState, d, CleanState.IDLE)
                     array.set(cmExtremeTaken, d, false)
                     array.set(cmBreakRef, d, na)
                     array.set(cmImpulse, d, na)
+                    array.set(cmTouchAlertFired, d, false)
 
-// Multi Clean Marker (parallel pipeline; wider straight-candle detection per spec)
+//────────────────────────────────────────
+// MULTI CLEAN — (A–D) chart map labels (Multi pipeline only; same refs on every TF)
+//────────────────────────────────────────
+f_mcmMapLabelsDelete(_d) =>
+    la = array.get(mcmMapLblA, _d)
+    if not na(la)
+        label.delete(la)
+        array.set(mcmMapLblA, _d, na)
+    lb = array.get(mcmMapLblB, _d)
+    if not na(lb)
+        label.delete(lb)
+        array.set(mcmMapLblB, _d, na)
+    lc = array.get(mcmMapLblC, _d)
+    if not na(lc)
+        label.delete(lc)
+        array.set(mcmMapLblC, _d, na)
+    ld = array.get(mcmMapLblD, _d)
+    if not na(ld)
+        label.delete(ld)
+        array.set(mcmMapLblD, _d, na)
+
+//────────────────────────────────────────
+// MULTI CLEAN MARKER PIPELINE — nearest pivot mo; segment from lastOpp before pivot; optional strict sweep
+//────────────────────────────────────────
 for d = 0 to 1
     dir = d == 0 ? 1 : -1
 
@@ -661,98 +816,177 @@ for d = 0 to 1
     if startContextM and array.get(mcmState, d) == CleanState.IDLE
         array.set(mcmState, d, CleanState.SCANNING)
 
-    lastOppBarM = f_findLastOppositeBar(dir, markerLookback)
-
+    // Multi clean: segment = impulse-only from opposite bar before pivot; WAIT ends on opposite BOS (not every pullback). Clean Marker uses opposite-in-WAIT on its own pipeline.
+    mcmOppositeBOS = (dir == 1 and bearBreak) or (dir == -1 and bullBreak)
     if array.get(mcmState, d) == CleanState.SCANNING
-        if f_isOpposite(dir)
+        if mcmOppositeBOS
             array.set(mcmState, d, CleanState.IDLE)
+            array.set(mcmTouchAlertFired, d, false)
         else
-            int mo = f_findMultiStraightOffset(dir, lastOppBarM)
-            if not na(mo) and not na(lastOppBarM)
-                if dir == 1
-                    array.set(mcmBreakRef, d, high[mo])
-                    array.set(mcmImpulse, d, low[mo])
-                else
-                    array.set(mcmBreakRef, d, low[mo])
-                    array.set(mcmImpulse, d, high[mo])
+            int mo = mcmPreferConfirmFirst ? f_findMultiStraightOffsetConfirmFirst(dir) : f_findMultiStraightOffset(dir)
+            if not na(mo)
+                int straightBar = bar_index - mo
+                int lastOppM = f_lastOppBarBefore(dir, straightBar)
+                bool mcmSegmentOk = not na(lastOppM) and (not requireImpulseAfterOpp or f_allImpulseBarsSince(dir, lastOppM))
+                if mcmSegmentOk and f_mcmPivotAfterOk(dir, mo)
+                    if dir == 1
+                        array.set(mcmBreakRef, d, high[mo])
+                        array.set(mcmImpulse, d, f_minLowStraightToNow(mo))
+                    else
+                        array.set(mcmBreakRef, d, low[mo])
+                        array.set(mcmImpulse, d, f_maxHighStraightToNow(mo))
 
-                offsetM = bar_index - lastOppBarM
+                    float nH = mo > 0 ? high[mo - 1] : na
+                    float nL = mo > 0 ? low[mo - 1] : na
+                    [adjTopM, adjBotM] = f_applyPivotWickRule(high[mo], low[mo], open[mo], close[mo], nH, nL, dir)
 
-                refHighM = high[offsetM]
-                refLowM  = low[offsetM]
-                refOpenM = open[offsetM]
+                    if dir == 1
+                        array.set(mcmExtreme, d, adjTopM)
+                    else
+                        array.set(mcmExtreme, d, adjBotM)
 
-                [adjTopM, adjBotM] = f_applyWickRule(refHighM, refLowM, refOpenM, high[offsetM - 1], low[offsetM - 1], dir)
-
-                if dir == 1
-                    array.set(mcmExtreme, d, adjTopM)
-                    array.set(mcmZoneLow, d, adjBotM)
-                else
-                    array.set(mcmExtreme, d, adjBotM)
-                    array.set(mcmZoneHigh, d, adjTopM)
-
-                array.set(mcmLeft, d, lastOppBarM)
-                array.set(mcmState, d, CleanState.WAIT_TAKE)
+                    array.set(mcmLeft, d, lastOppM)
+                    array.set(mcmPivotBar, d, straightBar)
+                    array.set(mcmTouchAlertFired, d, false)
+                    array.set(mcmState, d, CleanState.WAIT_TAKE)
 
     if array.get(mcmState, d) == CleanState.WAIT_TAKE
-        if f_isOpposite(dir)
+        if mcmOppositeBOS
+            f_mcmMapLabelsDelete(d)
             array.set(mcmState, d, CleanState.IDLE)
             array.set(mcmExtremeTaken, d, false)
             array.set(mcmBreakRef, d, na)
             array.set(mcmImpulse, d, na)
+            array.set(mcmPivotBar, d, int(na))
+            array.set(mcmTouchAlertFired, d, false)
         else
-            zoneHighM = dir == 1 ? array.get(mcmExtreme, d) : array.get(mcmZoneHigh, d)
-            zoneLowM  = dir == 1 ? array.get(mcmZoneLow, d) : array.get(mcmExtreme, d)
+            impM = array.get(mcmImpulse, d)
 
-            if f_sameDirTouch(dir, zoneHighM, zoneLowM, array.get(mcmLeft, d), true)
+            if dir == 1
+                impM := math.min(impM, low)
+            else
+                impM := math.max(impM, high)
+
+            array.set(mcmImpulse, d, impM)
+
+            zoneHighM = dir == 1 ? array.get(mcmExtreme, d) : array.get(mcmImpulse, d)
+            zoneLowM  = dir == 1 ? array.get(mcmImpulse, d) : array.get(mcmExtreme, d)
+
+            // Default (mcmStrictMode off): do not cancel WAIT on same-dir touch rules (they removed valid setups on pullbacks).
+            // Strict mode restores prior behavior: touch-cancel + must sweep OB extreme before straight close-break.
+            bool mcmTouchKill = mcmStrictMode and f_sameDirTouch(dir, zoneHighM, zoneLowM, array.get(mcmLeft, d), true)
+            if mcmTouchKill
+                f_mcmMapLabelsDelete(d)
                 array.set(mcmState, d, CleanState.IDLE)
                 array.set(mcmExtremeTaken, d, false)
                 array.set(mcmBreakRef, d, na)
                 array.set(mcmImpulse, d, na)
+                array.set(mcmPivotBar, d, int(na))
+                array.set(mcmTouchAlertFired, d, false)
 
             else
-                impM = array.get(mcmImpulse, d)
-
-                if dir == 1
-                    impM := math.min(impM, low)
-                else
-                    impM := math.max(impM, high)
-
-                array.set(mcmImpulse, d, impM)
-
-                if not array.get(mcmExtremeTaken, d) and f_extremeTaken(dir, array.get(mcmExtreme, d))
+                if mcmStrictMode and not array.get(mcmExtremeTaken, d) and f_extremeTaken(dir, array.get(mcmExtreme, d))
                     array.set(mcmExtremeTaken, d, true)
+
+                brkM = array.get(mcmBreakRef, d)
+                extM = array.get(mcmExtreme, d)
+                bool mcmWickCapped = not na(brkM) and not na(extM) and ((dir == 1 and extM < brkM) or (dir == -1 and extM > brkM))
+                bool zoneTouchM = math.max(high, low) >= zoneLowM and math.min(high, low) <= zoneHighM
+                if mcmWickCapped and zoneTouchM and barstate.isconfirmed and not array.get(mcmTouchAlertFired, d)
+                    array.set(mcmTouchAlertFired, d, true)
+                    if dir == 1
+                        bullConfirmed := true
+                    else
+                        bearConfirmed := true
 
                 // Straight level must be taken by a *closed* candle (close through ref), not wick-only
                 mcleanBreak = barstate.isconfirmed and (dir == 1 ? close > array.get(mcmBreakRef, d) : close < array.get(mcmBreakRef, d))
 
-                if array.get(mcmExtremeTaken, d) and mcleanBreak
-                    rawTopM = dir == 1 ? array.get(mcmExtreme, d) : array.get(mcmZoneHigh, d)
-                    rawBotM = dir == 1 ? array.get(mcmZoneLow, d) : array.get(mcmExtreme, d)
+                bool mcmSweepOk = not mcmStrictMode or array.get(mcmExtremeTaken, d)
+                if mcmSweepOk and mcleanBreak
+                    f_mcmMapLabelsDelete(d)
+                    rawTopM = dir == 1 ? array.get(mcmExtreme, d) : array.get(mcmImpulse, d)
+                    rawBotM = dir == 1 ? array.get(mcmImpulse, d) : array.get(mcmExtreme, d)
 
                     [zoneHighM2, zoneLowM2] = f_applyWickRule(rawTopM, rawBotM, open, high, low, dir)
 
+                    // Wick rule on pivot (candle 2): vs bar to the right; ignore wick past body edge (body top/bot — pivot may be bull or bear)
+                    float plotTopM = zoneHighM2
+                    float plotBotM = zoneLowM2
+                    int pvb = array.get(mcmPivotBar, d)
+                    int offPv = bar_index - pvb
+                    if useWickRule and not na(pvb) and offPv >= 1
+                        float nxtH = high[offPv - 1]
+                        float nxtL = low[offPv - 1]
+                        [tpiv, bpiv] = f_applyPivotWickRule(high[offPv], low[offPv], open[offPv], close[offPv], nxtH, nxtL, dir)
+                        if dir == 1
+                            plotTopM := tpiv
+                        else
+                            plotBotM := bpiv
+
                     impulseExtremeM = array.get(mcmImpulse, d)
 
-                    if f_distanceOk(dir == 1 ? zoneHighM2 : zoneLowM2, impulseExtremeM) and useMultiCleanMarker and not f_boxLeftExists(array.get(mcmLeft, d))
-                        if showMarkerHighlight
-                            label.new(bar_index - 1, dir == 1 ? zoneHighM2 : zoneLowM2, "MClean", style = dir == 1 ? label.style_label_down : label.style_label_up, color = dir == 1 ? color.new(color.teal, 77) : color.new(color.orange, 77), textcolor = color.white, size = size.normal)
-                        bxM = box.new(array.get(mcmLeft, d), zoneHighM2, bar_index, zoneLowM2, bgcolor = dir == 1 ? bullFill : bearFill, border_color = dir == 1 ? bullBorder : bearBorder)
+                    if f_distanceOk(dir == 1 ? plotTopM : plotBotM, impulseExtremeM) and useMultiCleanMarker and not f_boxLeftExists(array.get(mcmLeft, d))
+                        bxM = box.new(array.get(mcmLeft, d), plotTopM, bar_index, plotBotM, bgcolor = dir == 1 ? bullFill : bearFill, border_color = dir == 1 ? bullBorder : bearBorder)
+                        f_boxRegionLabel(array.get(mcmLeft, d), bar_index, plotTopM, "Multi clean", dir == 1 ? color.new(color.teal, 78) : color.new(color.orange, 78))
                         array.push(obBoxes, bxM)
-                        array.push(obTops, zoneHighM2)
-                        array.push(obBots, zoneLowM2)
+                        array.push(obTops, plotTopM)
+                        array.push(obBots, plotBotM)
                         array.push(obDirs, dir)
 
-                        if dir == 1
-                            bullConfirmed := true
-                        else
-                            bearConfirmed := true
+                        if not mcmWickCapped
+                            if dir == 1
+                                bullConfirmed := true
+                            else
+                                bearConfirmed := true
 
                     array.set(mcmState, d, CleanState.IDLE)
                     array.set(mcmExtremeTaken, d, false)
                     array.set(mcmBreakRef, d, na)
                     array.set(mcmImpulse, d, na)
+                    array.set(mcmPivotBar, d, int(na))
+                    array.set(mcmTouchAlertFired, d, false)
 
+                if not showMultiCleanMapLabels or not useMultiCleanMarker
+                    f_mcmMapLabelsDelete(d)
+                else if array.get(mcmState, d) == CleanState.WAIT_TAKE
+                    pvbMap = array.get(mcmPivotBar, d)
+                    moMap = not na(pvbMap) ? bar_index - pvbMap : na
+                    xMid = int(math.round((array.get(mcmLeft, d) + bar_index) / 2))
+                    colMap = dir == 1 ? color.new(color.teal, 12) : color.new(color.orange, 12)
+                    laA = array.get(mcmMapLblA, d)
+                    if na(laA)
+                        array.set(mcmMapLblA, d, label.new(xMid, zoneHighM, "(A) zone top", style = label.style_label_left, color = colMap, textcolor = color.white, size = size.tiny))
+                    else
+                        label.set_xy(laA, xMid, zoneHighM)
+                    laB = array.get(mcmMapLblB, d)
+                    if na(laB)
+                        array.set(mcmMapLblB, d, label.new(xMid, zoneLowM, "(B) zone bottom", style = label.style_label_left, color = colMap, textcolor = color.white, size = size.tiny))
+                    else
+                        label.set_xy(laB, xMid, zoneLowM)
+                    brkMap = array.get(mcmBreakRef, d)
+                    laC = array.get(mcmMapLblC, d)
+                    if na(laC)
+                        array.set(mcmMapLblC, d, label.new(xMid, brkMap, "(C) take level", style = label.style_label_left, color = color.new(color.yellow, 0), textcolor = color.black, size = size.tiny))
+                    else
+                        label.set_xy(laC, xMid, brkMap)
+                    if not na(moMap) and moMap >= 2
+                        xd = pvbMap + 2
+                        yd = hl2[moMap - 2]
+                        laD = array.get(mcmMapLblD, d)
+                        if na(laD)
+                            array.set(mcmMapLblD, d, label.new(xd, yd, "(D) invalid candle", style = label.style_label_down, color = color.new(color.gray, 35), textcolor = color.white, size = size.tiny))
+                        else
+                            label.set_xy(laD, xd, yd)
+                    else
+                        laD2 = array.get(mcmMapLblD, d)
+                        if not na(laD2)
+                            label.delete(laD2)
+                            array.set(mcmMapLblD, d, na)
+
+//────────────────────────────────────────
+// BREAK MARKER — f_bmHighLow: opposite cluster + first same-dir bar after (for break ref)
+//────────────────────────────────────────
 f_bmHighLow(_dir, maxLookback) =>
     bool isOpp = false
     float _bmHigh = na
@@ -770,9 +1004,9 @@ f_bmHighLow(_dir, maxLookback) =>
             break
     [_bmHigh, _bmLow, _bmPreHigh, _bmPreLow]
 
-//────────────────────
-// BREAK MARKER Logic (Fixed Slot Allocation)
-//────────────────────
+//────────────────────────────────────────
+// BREAK MARKER PIPELINE — BOS opens slot; COLLECT opposite → WAIT_BREAK → impulse break → box
+//────────────────────────────────────────
 for d = 0 to 1
     dir = d == 0 ? 1 : -1
     base = d * maxBMSeq
@@ -780,7 +1014,7 @@ for d = 0 to 1
     bos = f_isBreakContext(dir)
 
     //────────────────────
-    // BOS → allocate FREE slot
+    // BOS — grab next IDLE break-marker slot for this direction
     //────────────────────
     if bos
         int freeSlot = na
@@ -809,7 +1043,7 @@ for d = 0 to 1
     lastOppBar = f_findLastOppositeBar(dir, markerLookback)
 
     //────────────────────
-    // PROCESS ACTIVE SLOTS
+    // ACTIVE SLOTS — timeout stale; run COLLECT / WAIT_BREAK per slot
     //────────────────────
     for s = 0 to maxBMSeq - 1
         i = base + s
@@ -834,7 +1068,7 @@ for d = 0 to 1
                 continue
 
         //────────────────────
-        // COLLECT OPPOSITE
+        // COLLECT — stack opposite wicks until zone + left bar set → WAIT_BREAK
         //────────────────────
         if state == BreakState.COLLECT_OPPOSITE
 
@@ -863,7 +1097,7 @@ for d = 0 to 1
                     array.set(bmState, i, BreakState.WAIT_BREAK)
 
         //────────────────────
-        // WAIT BREAK
+        // WAIT_BREAK — touch cancel or impulse breaks ref cluster → Break box
         //────────────────────
         if array.get(bmState, i) == BreakState.WAIT_BREAK and barstate.isconfirmed
 
@@ -905,10 +1139,8 @@ for d = 0 to 1
                     zoneLow  = array.get(bmOBLow, i)
 
                     if f_distanceOk(dir == 1 ? zoneHigh : zoneLow, dir == 1 ? lowestBullish : highestBearish) and useBreakMarker and not f_boxLeftExists(array.get(bmLeft, i))
-                        if showMarkerHighlight
-                            label.new(bar_index - 1, dir == 1 ? zoneHigh : zoneLow, "Break", style = dir == 1 ? label.style_label_down : label.style_label_up, color = dir == 1 ? color.new(color.blue, 77) : color.new(color.red, 77), textcolor = color.white, size = size.normal)
-
                         bx = box.new( array.get(bmLeft, i), zoneHigh, bar_index, zoneLow, bgcolor = dir == 1 ? bullFill : bearFill, border_color = dir == 1 ? bullBorder : bearBorder)
+                        f_boxRegionLabel(array.get(bmLeft, i), bar_index, zoneHigh, "Break marker", dir == 1 ? color.new(color.blue, 78) : color.new(color.red, 78))
 
                         array.push(obBoxes, bx)
                         array.push(obTops, zoneHigh)
@@ -928,18 +1160,17 @@ for d = 0 to 1
                         array.set(bmOBHigh, i, na)
                         array.set(bmOBLow, i, na)
 
-// Track opposite candle extremes after BOS
-
-// For bullish OB: track bearish lows
+//────────────────────────────────────────
+// GENERAL MARKER — rolling gm* extremes (optional use with distance / context)
+//────────────────────────────────────────
 if isBear
     gmLowestBearishLow := na(gmLowestBearishLow) ? low : math.min(gmLowestBearishLow, low)
 
-// For bearish OB: track bullish highs
 if isBull
     gmHighestBullishHigh := na(gmHighestBullishHigh) ? high : math.max(gmHighestBullishHigh, high)
 
 //────────────────────────────────────────
-// Bullish state machine
+// GENERAL MARKER OB — BULL: BOS → PENDING (last bear zone) → AWAIT_SWEEP → sweep/PB → “Gen” box
 //────────────────────────────────────────
 if bullBreak and bullState == OBState.IDLE and showBullishOB and not isNeutral
     off = bar_index - lastBearBar
@@ -1001,9 +1232,7 @@ if bullState == OBState.AWAIT_SWEEP
         if f_distanceOk(bullTop, bullImpulseLow) and useGeneralMarker and not f_boxLeftExists(bullLeft)
             right = bar_index
             bx = box.new(bullLeft, bullTop, right, bullBot, bgcolor=bullFill, border_color=bullBorder)
-            if showMarkerHighlight
-                dir = 1
-                label.new(bar_index - 1, dir == 1 ? bullTop : bullBot, "Gen", style = dir == 1 ? label.style_label_down : label.style_label_up, color = dir == 1 ? color.new(color.blue, 77) : color.new(color.red, 77), textcolor = color.white, size = size.normal)
+            f_boxRegionLabel(bullLeft, right, bullTop, "General OB", color.new(color.blue, 78))
             array.push(obBoxes, bx)
             array.push(obTops, bullTop)
             array.push(obBots, bullBot)
@@ -1013,7 +1242,7 @@ if bullState == OBState.AWAIT_SWEEP
         bullState := OBState.IDLE
 
 //────────────────────────────────────────
-// Bearish state machine
+// GENERAL MARKER OB — BEAR: mirror of bull with bear BOS and last bull zone
 //────────────────────────────────────────
 if bearBreak and bearState == OBState.IDLE and showBearishOB and not isNeutral
     off = bar_index - lastBullBar
@@ -1073,10 +1302,8 @@ if bearState == OBState.AWAIT_SWEEP
     if (sweep1 or sweep2 or pbOk) and isBear
         if f_distanceOk(bearBot, bearImpulseHigh) and useGeneralMarker and not f_boxLeftExists(bearLeft)
             right = bar_index
-            if showMarkerHighlight
-                dir = -1
-                label.new(bar_index - 1, dir == 1 ? bearTop : bearBot, "Gen", style = dir == 1 ? label.style_label_down : label.style_label_up, color = dir == 1 ? color.new(color.blue, 77) : color.new(color.red, 77), textcolor = color.white, size = size.normal)
             bx = box.new(bearLeft, bearTop, right, bearBot, bgcolor=bearFill, border_color=bearBorder)
+            f_boxRegionLabel(bearLeft, right, bearTop, "General OB", color.new(color.red, 78))
             array.push(obBoxes, bx)
             array.push(obTops, bearTop)
             array.push(obBots, bearBot)
@@ -1088,7 +1315,7 @@ if bearState == OBState.AWAIT_SWEEP
 // if barstate.isconfirmed
 //     f_pruneOldest()
 //────────────────────────────────────────
-// Same-Direction Touch Deletion (IMMEDIATE)
+// MITIGATION — any touch of stored zone: flag + optional delete box or fade style
 //────────────────────────────────────────
 sz = array.size(obBoxes)
 if sz > 0
@@ -1118,7 +1345,7 @@ if sz > 0
                 box.set_border_color(bx, mitBorder)
 
 //────────────────────────────────────────
-// Zone touch on higher timeframe (per completed HTF candle)
+// HTF ZONE TOUCH — request.security HTF bar range vs obTops/obBots; fire once per HTF close
 //────────────────────────────────────────
 ztfSecHigh = request.security(syminfo.tickerid, zoneTouchTimeframe, high, barmerge.gaps_off, barmerge.lookahead_off)
 ztfSecLow = request.security(syminfo.tickerid, zoneTouchTimeframe, low, barmerge.gaps_off, barmerge.lookahead_off)
@@ -1135,7 +1362,47 @@ if htfZoneTouchAlert
     alert("OB zone touched on " + str.tostring(zoneTouchTimeframe) + " candle (" + (ztfTouchBull and ztfTouchBear ? "bull+bear" : ztfTouchBull ? "bullish" : "bearish") + ")", alert.freq_once_per_bar_close)
 
 //────────────────────────────────────────
-// Alerts
+// ON-CHART REGION GUIDE — table legend (last bar only)
+//────────────────────────────────────────
+var table regionGuideTbl = na
+var string lastRegionGuidePos = ""
+
+if barstate.islast
+    szGuide = f_regionGuideSize(regionGuideTextSize)
+    hdrBg = color.new(color.gray, 35)
+    cellBg = color.new(color.black, 88)
+    guideTxt = color.new(color.white, 12)
+    if showRegionGuidePanel
+        if not na(regionGuideTbl) and lastRegionGuidePos != regionGuidePosition
+            table.delete(regionGuideTbl)
+            regionGuideTbl := na
+        if na(regionGuideTbl)
+            regionGuideTbl := table.new(f_regionGuidePos(regionGuidePosition), 2, 8, bgcolor=cellBg, border_width=1, border_color=color.new(color.gray, 60))
+        lastRegionGuidePos := regionGuidePosition
+        table.cell(regionGuideTbl, 0, 0, "Region", text_color=color.white, bgcolor=hdrBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 1, 0, "Description", text_color=color.white, bgcolor=hdrBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 0, 1, "BOS", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 1, 1, "Close through last opposite wick → starts marker scans", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 0, 2, "General OB", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 1, 2, "Last opposite candle zone → confirm → sweep/PB → Gen box", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 0, 3, "Clean marker", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 1, 3, "Pivot + close takes wick ref; if pivot wick rule caps zone, OB alert on zone touch only (not on close through raw wick); optional: reject if 1st bar after pattern is opposite color", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 0, 4, "Multi clean", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 1, 4, "Separate from Break marker. After BOS: fractal + segment; (A–D) during WAIT; “Multi clean” box only after close takes ref (+ distance). Not every Break-marker bar arms Multi clean.", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 0, 5, "Break marker", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 1, 5, "Own pipeline: BOS slot → opposite stack → impulse breaks ref → Break box (not Multi clean)", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 0, 6, "Mitigation", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 1, 6, "Price touches zone → mitigated alert; delete or fade box", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 0, 7, "HTF touch", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 1, 7, "Optional: completed HTF bar overlaps any stored zone", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+    else
+        if not na(regionGuideTbl)
+            table.delete(regionGuideTbl)
+            regionGuideTbl := na
+        lastRegionGuidePos := ""
+
+//────────────────────────────────────────
+// ALERTCONDITIONS — expose confirm, mitigate, HTF touch to TradingView alert dialog
 //────────────────────────────────────────
 alertcondition(bullConfirmed, title="Bullish OB Confirmed", message="Bullish OB confirmed")
 alertcondition(bearConfirmed, title="Bearish OB Confirmed", message="Bearish OB confirmed")

@@ -7,12 +7,13 @@
 //| from that file for full parity.                                 |
 //+------------------------------------------------------------------+
 #property copyright "OB zones port"
-#property version   "1.42"
+#property version   "1.53"
 #property indicator_chart_window
 #property indicator_plots 0
 
 input bool   InpUseCleanMarker      = true;
 input bool   InpUseMultiCleanMarker = true;
+input bool   InpMcmStrictMode       = false;  // true = OB extreme sweep + SameDirTouch cancel (old behavior)
 input bool   InpEnableDistance      = true;
 input double InpMaxDistancePips     = 100.0;
 input int    InpMarkerLookback      = 80;
@@ -54,6 +55,7 @@ double g_mcmExtreme[2],g_mcmZoneLow[2],g_mcmZoneHigh[2],g_mcmBreakRef[2],g_mcmIm
 int    g_cmIdxLeft[2], g_mcmIdxLeft[2];
 long   g_cmPineLeft[2], g_mcmPineLeft[2];
 bool   g_cmExtremeTaken[2], g_mcmExtremeTaken[2];
+int    g_mcmPivotIdx[2];
 
 double g_lastBearHigh=0,g_lastBearLow=0,g_lastBearOpen=0;
 long   g_lastBearBar=-1;
@@ -73,6 +75,7 @@ int OnInit()
       g_cmIdxLeft[d]=g_mcmIdxLeft[d]=-1;
       g_cmPineLeft[d]=g_mcmPineLeft[d]=-1;
       g_cmExtremeTaken[d]=g_mcmExtremeTaken[d]=false;
+      g_mcmPivotIdx[d]=-1;
      }
    g_lastBearBar=g_lastBullBar=-1;
    return(INIT_SUCCEEDED);
@@ -119,6 +122,20 @@ void ApplyWickRule(const int dir,const double refH,const double refL,const doubl
    if(dir==-1 && refL<nextL) zBot=refO;
   }
 
+// 1–2–3 pivot may be bull or bear; cap wick to body top/bottom (classic OB uses opposite candle where open is already that edge).
+void ApplyPivotWickRule(const int dir,const double refH,const double refL,const double refO,const double refC,
+                        const double nextH,const double nextL,const bool useWick,
+                        double &zTop,double &zBot)
+  {
+   zTop=refH;
+   zBot=refL;
+   if(!useWick) return;
+   const double bodyTop=MathMax(refO,refC);
+   const double bodyBot=MathMin(refO,refC);
+   if(dir==1 && refH>nextH) zTop=bodyTop;
+   if(dir==-1 && refL<nextL) zBot=bodyBot;
+  }
+
 bool BoxLeftTimeExists(const datetime tLeft)
   {
    for(int i=0;i<g_obCount;i++)
@@ -139,30 +156,39 @@ bool AllImpulseBarsSince(const int dir,const int idxOpp,const int idxCur,
    return true;
   }
 
-int FindMultiStraightOffset(const int dir,const int idxOpp,const int idxCur,const int total,
+// Opposite bar older than straightIdx (larger series index = older in replay)
+int FindLastOppIdxBefore(const int dir,const int straightIdx,const int total,
+                         const double &open[],const double &close[])
+  {
+   for(int step=1; step<=InpMarkerLookback; step++)
+     {
+      int iOlder = straightIdx + step;
+      if(iOlder>=total) break;
+      if(dir==1 && IsBear(close[iOlder],open[iOlder])) return iOlder;
+      if(dir==-1 && IsBull(close[iOlder],open[iOlder])) return iOlder;
+     }
+   return -1;
+  }
+
+int FindMultiStraightOffset(const int dir,const int idxCur,const int total,
                             const double &high[],const double &low[],
                             const double &open[],const double &close[])
   {
-   if(idxOpp<0 || !AllImpulseBarsSince(dir,idxOpp,idxCur,open,close,total)) return -1;
-   int maxMo = (int)MathMin(InpMarkerLookback, idxOpp - idxCur - 1);
-   maxMo = (int)MathMin(maxMo, total - 1 - idxCur);
+   int maxMo = (int)MathMin(InpMarkerLookback, total - 1 - idxCur);
    if(maxMo<1) return -1;
    for(int j=0;j<maxMo;j++)
      {
       int mo = maxMo - j;
       if(idxCur + mo >= total) continue;
-      if(idxOpp <= idxCur + mo) continue;
       int im = idxCur + mo;
       int im1 = im + 1;
       int im_1 = im - 1;
       if(im1>=total || im_1<0) continue;
       bool pat=false;
       if(dir==1)
-         pat = high[im]>high[im1] && high[im]>high[im_1]
-               && IsStrictBull(close[im],open[im]) && IsStrictBull(close[im1],open[im1]) && IsStrictBull(close[im_1],open[im_1]);
+         pat = high[im]>high[im1] && high[im]>high[im_1];
       else
-         pat = low[im]<low[im1] && low[im]<low[im_1]
-               && IsStrictBear(close[im],open[im]) && IsStrictBear(close[im1],open[im1]) && IsStrictBear(close[im_1],open[im_1]);
+         pat = low[im]<low[im1] && low[im]<low[im_1];
       if(pat) return mo;
      }
    return -1;
@@ -324,6 +350,7 @@ int OnCalculate(const int rates_total,
       g_cmIdxLeft[d]=g_mcmIdxLeft[d]=-1;
       g_cmPineLeft[d]=g_mcmPineLeft[d]=-1;
       g_cmExtremeTaken[d]=g_mcmExtremeTaken[d]=false;
+      g_mcmPivotIdx[d]=-1;
      }
    g_lastBearBar=g_lastBullBar=-1;
    g_lastBearHigh=g_lastBearLow=g_lastBearOpen=0;
@@ -432,30 +459,42 @@ int OnCalculate(const int rates_total,
          int dir = d==0?1:-1;
          bool startCtx = (dir==1 && bullBreak) || (dir==-1 && bearBreak);
          if(startCtx && g_mcmState[d]==C_IDLE) g_mcmState[d]=C_SCAN;
-         int ioppM = FindLastOppositeIdx(dir, idx, open, close, rates_total);
+         bool mcmOppositeBOS = (dir==1 && bearBreak) || (dir==-1 && bullBreak);
          if(g_mcmState[d]==C_SCAN)
            {
-            bool opp = (dir==1)?isBear:isBull;
-            if(opp) g_mcmState[d]=C_IDLE;
+            if(mcmOppositeBOS) g_mcmState[d]=C_IDLE;
             else
               {
-               int mo = FindMultiStraightOffset(dir, ioppM, idx, rates_total, high, low, open, close);
-               if(mo>=0 && ioppM>=0)
+               int ioppSeg = FindLastOppositeIdx(dir, idx, open, close, rates_total);
+               bool mcmSegOk = (ioppSeg<0) || AllImpulseBarsSince(dir, ioppSeg, idx, open, close, rates_total);
+               int mo = FindMultiStraightOffset(dir, idx, rates_total, high, low, open, close);
+               if(mo>=0 && mcmSegOk)
                  {
                   int im = idx + mo;
-                  int iop = ioppM;
-                  if(iop<rates_total && iop-1>=0)
+                  int iop = FindLastOppIdxBefore(dir, im, rates_total, open, close);
+                  if(iop<0) iop = im + 1;
+                  if(iop>=rates_total) iop = im;
+                  bool pivotRightOk = true;
+                  if(im-1>=0 && im-1<rates_total)
+                    {
+                     if(dir==1) pivotRightOk = !IsBear(close[im-1],open[im-1]);
+                     else       pivotRightOk = !IsBull(close[im-1],open[im-1]);
+                    }
+                  if(iop<rates_total && pivotRightOk)
                     {
                      if(dir==1){ g_mcmBreakRef[d]=high[im]; g_mcmImpulse[d]=low[im]; }
                      else { g_mcmBreakRef[d]=low[im]; g_mcmImpulse[d]=high[im]; }
                      double rH=high[iop], rL=low[iop], rO=open[iop];
+                     double nH = (iop>0) ? high[iop-1] : rH;
+                     double nL = (iop>0) ? low[iop-1] : rL;
                      double zt,zb;
-                     ApplyWickRule(dir,rH,rL,rO,high[iop-1],low[iop-1],InpUseWickRule,zt,zb);
+                     ApplyWickRule(dir,rH,rL,rO,nH,nL,InpUseWickRule,zt,zb);
                      if(dir==1){ g_mcmExtreme[d]=zt; g_mcmZoneLow[d]=zb; }
                      else { g_mcmExtreme[d]=zb; g_mcmZoneHigh[d]=zt; }
                      g_mcmIdxLeft[d]=iop;
                      g_mcmPineLeft[d]=pineBar - (iop - idx);
                      g_mcmExtremeTaken[d]=false;
+                     g_mcmPivotIdx[d]=im;
                      g_mcmState[d]=C_WAIT;
                     }
                  }
@@ -463,29 +502,42 @@ int OnCalculate(const int rates_total,
            }
          if(g_mcmState[d]==C_WAIT)
            {
-            bool opp = (dir==1)?isBear:isBull;
-            if(opp){ g_mcmState[d]=C_IDLE; continue; }
+            if(mcmOppositeBOS){ g_mcmState[d]=C_IDLE; g_mcmExtremeTaken[d]=false; g_mcmBreakRef[d]=0; g_mcmImpulse[d]=0; g_mcmPivotIdx[d]=-1; continue; }
             double zoneHigh = dir==1?g_mcmExtreme[d]:g_mcmZoneHigh[d];
             double zoneLow  = dir==1?g_mcmZoneLow[d]:g_mcmExtreme[d];
-            if(SameDirTouch(dir,zoneHigh,zoneLow,g_mcmPineLeft[d],pineBar,true,H,L,O,C,idx,high,low,open,close,rates_total))
-              { g_mcmState[d]=C_IDLE; continue; }
+            bool touchKill = InpMcmStrictMode && SameDirTouch(dir,zoneHigh,zoneLow,g_mcmPineLeft[d],pineBar,true,H,L,O,C,idx,high,low,open,close,rates_total);
+            if(touchKill){ g_mcmState[d]=C_IDLE; g_mcmExtremeTaken[d]=false; g_mcmBreakRef[d]=0; g_mcmImpulse[d]=0; g_mcmPivotIdx[d]=-1; continue; }
             if(dir==1) g_mcmImpulse[d]=MathMin(g_mcmImpulse[d], L);
             else       g_mcmImpulse[d]=MathMax(g_mcmImpulse[d], H);
             bool extTaken=g_mcmExtremeTaken[d];
-            if(!extTaken){ if(dir==1&&H>g_mcmExtreme[d])extTaken=true; if(dir==-1&&L<g_mcmExtreme[d])extTaken=true; }
-            g_mcmExtremeTaken[d]=extTaken;
-            // Multi clean: straight level taken by close (closed candle), not wick-only
+            if(InpMcmStrictMode)
+              {
+               if(!extTaken){ if(dir==1&&H>g_mcmExtreme[d])extTaken=true; if(dir==-1&&L<g_mcmExtreme[d])extTaken=true; }
+               g_mcmExtremeTaken[d]=extTaken;
+              }
+            // Multi clean: straight level taken by close
             bool mcbreak=(dir==1)?(C>g_mcmBreakRef[d]):(C<g_mcmBreakRef[d]);
-            if(extTaken && mcbreak)
+            bool sweepOk = !InpMcmStrictMode || g_mcmExtremeTaken[d];
+            if(sweepOk && mcbreak)
               {
                double rawTop=dir==1?g_mcmExtreme[d]:g_mcmZoneHigh[d];
                double rawBot=dir==1?g_mcmZoneLow[d]:g_mcmExtreme[d];
                double fh,fl;
                ApplyWickRule(dir,rawTop,rawBot,O,H,L,InpUseWickRule,fh,fl);
+               double plotTop=fh, plotBot=fl;
+               int piv=g_mcmPivotIdx[d];
+               if(InpUseWickRule && piv>=1 && piv<rates_total)
+                 {
+                  double t2,b2;
+                  ApplyPivotWickRule(dir,high[piv],low[piv],open[piv],close[piv],high[piv-1],low[piv-1],InpUseWickRule,t2,b2);
+                  if(dir==1) plotTop=t2;
+                  else plotBot=b2;
+                 }
                datetime tL = time[g_mcmIdxLeft[d]];
-               if(DistanceOk(dir,dir==1?fh:fl,g_mcmImpulse[d]) && InpUseMultiCleanMarker && !BoxLeftTimeExists(tL))
-                  PushOb(tL, T, fh, fl, dir);
+               if(DistanceOk(dir,dir==1?plotTop:plotBot,g_mcmImpulse[d]) && InpUseMultiCleanMarker && !BoxLeftTimeExists(tL))
+                  PushOb(tL, T, plotTop, plotBot, dir);
                g_mcmState[d]=C_IDLE;
+               g_mcmPivotIdx[d]=-1;
               }
            }
         }
