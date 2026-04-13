@@ -1,7 +1,7 @@
 //@version=5
 // Order blocks: BOS-driven zones via General (straight/swing/sweep), Clean, Multi-Clean, and Break markers.
 // Includes wick rules, distance filter, mitigation, optional HTF touch alerts.
-indicator("Order Block Indicator V1.4.26 (Multi Clean + HTF touch alerts)", overlay=true, max_boxes_count=500, max_labels_count=500, max_bars_back=500)
+indicator("Order Block Indicator V1.4.27 (Clean marker bull/bear triple + HTF touch alerts)", overlay=true, max_boxes_count=500, max_labels_count=500, max_bars_back=500)
 
 //────────────────────────────────────────
 // ENUMS & STATE TYPES — machine states for general OB, clean/multi-clean, break-marker slots
@@ -134,8 +134,8 @@ mcmPreferConfirmFirst = input.bool(true, "Prefer pivot that confirms first", too
 mcmSkipInvalidCandleRule = input.bool(true, "Multi clean: skip INV (invalid-candle) filter", tooltip="When on, Multi clean does not reject setups when the first bar after the 3-bar pattern is opposite color (matches more manual zones). Clean marker still uses INV.", group="Multi clean")
 useBreakMarker = input.bool(true, "Break Marker")
 
-// Clean / Multi pivot: optional “all bull/bear after last opposite” filter (off = candle-2 can be bear like your fractal-high example)
-requireImpulseAfterOpp = input.bool(false, "Clean/Multi: impulse-only bars after last opposite")
+// Multi clean only — Clean marker always requires impulse-only bars after last opposite (any bear in that leg → no Clean box; use Break marker).
+requireImpulseAfterOpp = input.bool(false, "Multi clean: impulse-only bars after last opposite")
 
 // Mitigation — delete vs fade when zone is traded through
 deleteMitigatedBoxes = input.bool(false, "Delete Mitigated OBs")
@@ -287,13 +287,11 @@ f_markerBearLookback() =>
 
     requireBothMarkers ? (straightOK and swingOK) : (straightOK or swingOK or (not useStraightMarker and not useSwingMarker))
 
-f_cleanStraightBull() =>
-    high[1] > high[2] and high[1] > high[0]
-
 //────────────────────────────────────────
 // CLEAN / MULTI-CLEAN HELPERS — impulse-only segment, opposite before pivot, straight pivot search, impulse fold
 //────────────────────────────────────────
-// Multi clean: entire segment after opposite bar must be impulse-only; straight = local high/low peak on 3 bars (mo = offset of straight candle from current bar).
+// Multi clean: entire segment after opposite bar must be impulse-only when requireImpulseAfterOpp; straight = local high/low peak on 3 bars (mo = offset of straight candle from current bar).
+// Clean marker: same 3-bar wick pivot but all three candles must be impulse (bull or bear); segment after last opposite before pivot must be impulse-only (no bear in a bull leg — else Break marker only).
 f_allImpulseBarsSince(dir, lastOppBarIdx) =>
     bool ok = true
     if na(lastOppBarIdx) or lastOppBarIdx >= bar_index
@@ -329,7 +327,29 @@ f_lastOppBarBefore(dir, straightBarIdx) =>
                 break
     res
 
-// Multi clean / Clean: 3-bar pivot on highs/lows — middle candle (“candle 2”) can be any color; only wick extreme vs neighbors matters. Nearest match (smallest mo) breaks first.
+// Clean marker: nearest3-bar straight wick pivot where all three bars are impulse (strict bull / strict bear); segment after last opposite before pivot is impulse-only; INV on first bar after “candle 3”.
+f_findCleanStraightOffset(dir) =>
+    int result = int(na)
+    int maxMo = math.min(markerLookback, bar_index - 1)
+    if maxMo >= 1
+        for mo = 1 to maxMo
+            bool pat = false
+            if dir == 1
+                pat := high[mo] > high[mo + 1] and high[mo] > high[mo - 1]
+                pat := pat and close[mo] > open[mo] and close[mo + 1] > open[mo + 1] and close[mo - 1] > open[mo - 1]
+            else
+                pat := low[mo] < low[mo + 1] and low[mo] < low[mo - 1]
+                pat := pat and close[mo] < open[mo] and close[mo + 1] < open[mo + 1] and close[mo - 1] < open[mo - 1]
+            if pat
+                int straightBar = bar_index - mo
+                int lastOpp = f_lastOppBarBefore(dir, straightBar)
+                bool segAllImpulse = not na(lastOpp) and f_allImpulseBarsSince(dir, lastOpp)
+                if segAllImpulse and f_pivotAfterC3Ok(dir, mo)
+                    result := mo
+                    break
+    result
+
+// Multi clean: 3-bar pivot on highs/lows — middle candle (“candle 2”) can be any color; only wick extreme vs neighbors matters. Nearest match (smallest mo) breaks first.
 f_findMultiStraightOffset(dir) =>
     int result = int(na)
     int maxMo = math.min(markerLookback, bar_index - 1)
@@ -680,16 +700,15 @@ for d = 0 to 1
         array.set(cmState, d, CleanState.SCANNING)
 
     if array.get(cmState, d) == CleanState.SCANNING
-        moCl = f_findMultiStraightOffset(dir)
+        moCl = f_findCleanStraightOffset(dir)
         straightBarCl = not na(moCl) ? bar_index - moCl : na
         lastOppCl = not na(straightBarCl) ? f_lastOppBarBefore(dir, straightBarCl) : na
-        cleanSegmentOk = not na(lastOppCl) and (not requireImpulseAfterOpp or f_allImpulseBarsSince(dir, lastOppCl))
 
         if f_isOpposite(dir)
             array.set(cmState, d, CleanState.IDLE)
             array.set(cmTouchAlertFired, d, false)
         
-        else if not na(moCl) and cleanSegmentOk and f_pivotAfterC3Ok(dir, moCl)
+        else if not na(moCl) and not na(lastOppCl)
             if dir == 1
                 array.set(cmBreakRef, d, high[moCl])
                 array.set(cmImpulse, d, f_minLowStraightToNow(moCl))
@@ -752,8 +771,8 @@ for d = 0 to 1
                     else
                         bearConfirmed := true
 
-                // Candle-2 level taken by *close* (confirmed bar), not wick-only
-                cleanBreak = barstate.isconfirmed and (dir == 1 ? close > array.get(cmBreakRef, d) : close < array.get(cmBreakRef, d))
+                // Straight level taken by *close* on a strict impulse bar (bullish / bearish), not wick-only
+                cleanBreak = barstate.isconfirmed and (dir == 1 ? close > array.get(cmBreakRef, d) and isStrictBull : close < array.get(cmBreakRef, d) and isStrictBear)
 
                 if cleanBreak
                     rawTop = dir == 1 ? array.get(cmExtreme, d) : array.get(cmImpulse, d)

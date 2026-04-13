@@ -7,7 +7,7 @@
 //| from that file for full parity.                                 |
 //+------------------------------------------------------------------+
 #property copyright "OB zones port"
-#property version   "1.53"
+#property version   "1.54"
 #property indicator_chart_window
 #property indicator_plots 0
 
@@ -190,6 +190,58 @@ int FindMultiStraightOffset(const int dir,const int idxCur,const int total,
       else
          pat = low[im]<low[im1] && low[im]<low[im_1];
       if(pat) return mo;
+     }
+   return -1;
+  }
+
+// Clean: nearest 3-bar straight wick + all three strict impulse; segment after last opposite before pivot is impulse-only (matches Pine f_findCleanStraightOffset).
+double MinLowIdxSpan(const int iOlder,const int iNewer,const int total,const double &low[])
+  {
+   double m = low[iOlder];
+   for(int u=iOlder; u>=iNewer; u--)
+      if(u>=0 && u<total) m=MathMin(m, low[u]);
+   return m;
+  }
+
+double MaxHighIdxSpan(const int iOlder,const int iNewer,const int total,const double &high[])
+  {
+   double m = high[iOlder];
+   for(int u=iOlder; u>=iNewer; u--)
+      if(u>=0 && u<total) m=MathMax(m, high[u]);
+   return m;
+  }
+
+int FindCleanStraightOffset(const int dir,const int idxCur,const int total,
+                            const double &high[],const double &low[],
+                            const double &open[],const double &close[])
+  {
+   int maxMo = (int)MathMin(InpMarkerLookback, total - 1 - idxCur);
+   if(maxMo<1) return -1;
+   for(int mo=1; mo<=maxMo; mo++)
+     {
+      int im = idxCur + mo;
+      int im1 = im + 1;
+      int im_1 = im - 1;
+      if(im1>=total || im_1<0 || im>=total || im<0) continue;
+      bool pat=false;
+      if(dir==1)
+         pat = high[im]>high[im1] && high[im]>high[im_1]
+            && IsStrictBull(close[im],open[im]) && IsStrictBull(close[im1],open[im1]) && IsStrictBull(close[im_1],open[im_1]);
+      else
+         pat = low[im]<low[im1] && low[im]<low[im_1]
+            && IsStrictBear(close[im],open[im]) && IsStrictBear(close[im1],open[im1]) && IsStrictBear(close[im_1],open[im_1]);
+      if(!pat) continue;
+      int iop = FindLastOppIdxBefore(dir, im, total, open, close);
+      if(iop<0) continue;
+      if(!AllImpulseBarsSince(dir, iop, idxCur, open, close, total)) continue;
+      bool pivotAfterOk = true;
+      if(mo>=2 && im-2>=0 && im-2<total)
+        {
+         if(dir==1 && IsBear(close[im-2],open[im-2])) pivotAfterOk = false;
+         if(dir==-1 && IsBull(close[im-2],open[im-2])) pivotAfterOk = false;
+        }
+      if(!pivotAfterOk) continue;
+      return mo;
      }
    return -1;
   }
@@ -387,32 +439,36 @@ int OnCalculate(const int rates_total,
          bool startCtx = (dir==1 && bullBreak) || (dir==-1 && bearBreak);
          if(startCtx && g_cmState[d]==C_IDLE) g_cmState[d]=C_SCAN;
 
-         int ioppD = FindLastOppositeIdx(dir, idx, open, close, rates_total);
-
          if(g_cmState[d]==C_SCAN)
            {
             bool opp = (dir==1)?isBear:isBull;
             if(opp) g_cmState[d]=C_IDLE;
-            else if(pineBar>=2 && idx+2<rates_total)
+            else
               {
-               int i2=idx+2,i1=idx+1,i0=idx;
-               bool cleanStraight = (dir==1)
-                  ? (IsStrictBull(close[i2],open[i2])&&IsStrictBull(close[i1],open[i1])&&IsStrictBull(close[i0],open[i0])
-                     && high[i1]>high[i2] && high[i1]>high[i0])
-                  : (IsStrictBear(close[i2],open[i2])&&IsStrictBear(close[i1],open[i1])&&IsStrictBear(close[i0],open[i0])
-                     && low[i1]<low[i2] && low[i1]<low[i0]);
-               bool cleanSegOk = AllImpulseBarsSince(dir,ioppD,idx,open,close,rates_total);
-               if(cleanStraight && ioppD>=0 && cleanSegOk)
+               int moCl = FindCleanStraightOffset(dir, idx, rates_total, high, low, open, close);
+               if(moCl>=0)
                  {
-                  int iop = ioppD;
-                  if(iop<rates_total && iop-1>=0)
+                  int im = idx + moCl;
+                  int im_1 = im - 1;
+                  int iop = FindLastOppIdxBefore(dir, im, rates_total, open, close);
+                  if(iop>=0 && iop<rates_total)
                     {
-                     double rH=high[iop], rL=low[iop], rO=open[iop];
-                     double nH=high[iop-1], nL=low[iop-1];
-                     double zt,zb;
-                     ApplyWickRule(dir,rH,rL,rO,nH,nL,InpUseWickRule,zt,zb);
-                     if(dir==1){ g_cmExtreme[d]=zt; g_cmZoneLow[d]=zb; g_cmBreakRef[d]=high[i1]; g_cmImpulse[d]=low[i1]; }
-                     else { g_cmExtreme[d]=zb; g_cmZoneHigh[d]=zt; g_cmBreakRef[d]=low[i1]; g_cmImpulse[d]=high[i1]; }
+                     double nH = (im_1>=0 && im_1<rates_total) ? high[im_1] : high[im];
+                     double nL = (im_1>=0 && im_1<rates_total) ? low[im_1] : low[im];
+                     double adjTop, adjBot;
+                     ApplyPivotWickRule(dir, high[im], low[im], open[im], close[im], nH, nL, InpUseWickRule, adjTop, adjBot);
+                     if(dir==1)
+                       {
+                        g_cmExtreme[d]=adjTop;
+                        g_cmBreakRef[d]=high[im];
+                        g_cmImpulse[d]=MinLowIdxSpan(im, idx, rates_total, low);
+                       }
+                     else
+                       {
+                        g_cmExtreme[d]=adjBot;
+                        g_cmBreakRef[d]=low[im];
+                        g_cmImpulse[d]=MaxHighIdxSpan(im, idx, rates_total, high);
+                       }
                      g_cmIdxLeft[d]=iop;
                      g_cmPineLeft[d]=pineBar - (iop - idx);
                      g_cmExtremeTaken[d]=false;
@@ -426,8 +482,8 @@ int OnCalculate(const int rates_total,
            {
             bool opp = (dir==1)?isBear:isBull;
             if(opp){ g_cmState[d]=C_IDLE; continue; }
-            double zoneHigh = dir==1?g_cmExtreme[d]:g_cmZoneHigh[d];
-            double zoneLow  = dir==1?g_cmZoneLow[d]:g_cmExtreme[d];
+            double zoneHigh = dir==1?g_cmExtreme[d]:g_cmImpulse[d];
+            double zoneLow  = dir==1?g_cmImpulse[d]:g_cmExtreme[d];
             if(SameDirTouch(dir,zoneHigh,zoneLow,g_cmPineLeft[d],pineBar,true,H,L,O,C,idx,high,low,open,close,rates_total))
               { g_cmState[d]=C_IDLE; continue; }
 
@@ -438,12 +494,12 @@ int OnCalculate(const int rates_total,
             if(!extTaken){ if(dir==1&&H>g_cmExtreme[d])extTaken=true; if(dir==-1&&L<g_cmExtreme[d])extTaken=true; }
             g_cmExtremeTaken[d]=extTaken;
 
-            // Clean: straight high/low taken by close (closed bar)
-            bool cleanBreak = (dir==1)? (C>g_cmBreakRef[d]) : (C<g_cmBreakRef[d]);
+            // Clean: straight level taken by strict impulse close
+            bool cleanBreak = (dir==1)? (C>g_cmBreakRef[d] && IsStrictBull(C,O)) : (C<g_cmBreakRef[d] && IsStrictBear(C,O));
             if(extTaken && cleanBreak)
               {
-               double rawTop = dir==1?g_cmExtreme[d]:g_cmZoneHigh[d];
-               double rawBot = dir==1?g_cmZoneLow[d]:g_cmExtreme[d];
+               double rawTop = dir==1?g_cmExtreme[d]:g_cmImpulse[d];
+               double rawBot = dir==1?g_cmImpulse[d]:g_cmExtreme[d];
                double fh,fl;
                ApplyWickRule(dir,rawTop,rawBot,O,H,L,InpUseWickRule,fh,fl);
                datetime tL = time[g_cmIdxLeft[d]];
