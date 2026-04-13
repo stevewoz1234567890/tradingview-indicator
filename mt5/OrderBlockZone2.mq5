@@ -3,7 +3,7 @@
 //| MT5 port of Order Block Indicator (zones 2.0) — Clean Marker,    |
 //| Multi Clean Marker, mitigation, HTF zone-touch alerts.         |
 //| General Marker + Break Marker pipelines match Pine in            |
-//| Order Block Indicator(zone2.0)_14.txt — extend OnCalculate       |
+//| OrderBlockZoneIndicator.pine — extend OnCalculate |
 //| from that file for full parity.                                 |
 //+------------------------------------------------------------------+
 #property copyright "OB zones port"

@@ -50,7 +50,7 @@ Same **3-bar straight wick** idea, but the **middle** candle **may** be the “w
 
 | Path | Description |
 |------|-------------|
-| `Order Block Indicator(zone2.0)_14.txt` | Pine v5 source — paste into TradingView **Pine Editor** → **Add to chart**. Current title line shows the version (e.g. V1.4.28). |
+| `OrderBlockZoneIndicator.pine` | Pine v5 source — paste into TradingView **Pine Editor** → **Add to chart**. The `indicator(...)` title line shows the version (e.g. V1.4.28). |
 | `mt5/OrderBlockZone2.mq5` | MetaTrader 5 port (**v1.55** in `#property version`). **Clean** and **Multi clean** follow the same rules as Pine for straight fractal, impulse-only leg, triple-after-opposite (Multi), pivot wick zone, and strict take close. **Not** ported: Multi clean **“prefer pivot that confirms first”** (Pine input `mcmPreferConfirmFirst`). |
 | `img/clean-marker-bullish-example.png` | Schematic: bullish clean marker (strict triple, zone, take). |
 | `img/clean-marker-bearish-example.png` | Schematic: bearish clean marker (strict triple). |
@@ -62,7 +62,7 @@ Same **3-bar straight wick** idea, but the **middle** candle **may** be the “w
 
 **TradingView**
 
-1. Open **Pine Editor** → create indicator → paste contents of `Order Block Indicator(zone2.0)_14.txt`.
+1. Open **Pine Editor** → create indicator → paste contents of `OrderBlockZoneIndicator.pine`.
 2. **Save** / **Add to chart**.
 3. Adjust **inputs**: toggle General / Clean / Multi clean / Break markers, **max distance** (pips), Multi clean strict mode / INV skip / confirm-first, mitigation, HTF zone-touch alerts.
 
