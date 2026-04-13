@@ -1,7 +1,7 @@
 //@version=5
 // Order blocks: BOS-driven zones via General (straight/swing/sweep), Clean, Multi-Clean, and Break markers.
 // Includes wick rules, distance filter, mitigation, optional HTF touch alerts.
-indicator("Order Block Indicator V1.4.27 (Clean marker bull/bear triple + HTF touch alerts)", overlay=true, max_boxes_count=500, max_labels_count=500, max_bars_back=500)
+indicator("Order Block Indicator V1.4.28 (Multi clean impulse leg + straight-after-opp)", overlay=true, max_boxes_count=500, max_labels_count=500, max_bars_back=500)
 
 //────────────────────────────────────────
 // ENUMS & STATE TYPES — machine states for general OB, clean/multi-clean, break-marker slots
@@ -133,9 +133,6 @@ showMultiCleanMapLabels = input.bool(false, "Show (A–D) letters while Multi cl
 mcmPreferConfirmFirst = input.bool(true, "Prefer pivot that confirms first", tooltip="Among valid fractals, choose the one whose take level (close through ref) is crossed earliest in time. Off = nearest pivot (smallest mo), previous behavior.", group="Multi clean")
 mcmSkipInvalidCandleRule = input.bool(true, "Multi clean: skip INV (invalid-candle) filter", tooltip="When on, Multi clean does not reject setups when the first bar after the 3-bar pattern is opposite color (matches more manual zones). Clean marker still uses INV.", group="Multi clean")
 useBreakMarker = input.bool(true, "Break Marker")
-
-// Multi clean only — Clean marker always requires impulse-only bars after last opposite (any bear in that leg → no Clean box; use Break marker).
-requireImpulseAfterOpp = input.bool(false, "Multi clean: impulse-only bars after last opposite")
 
 // Mitigation — delete vs fade when zone is traded through
 deleteMitigatedBoxes = input.bool(false, "Delete Mitigated OBs")
@@ -290,8 +287,8 @@ f_markerBearLookback() =>
 //────────────────────────────────────────
 // CLEAN / MULTI-CLEAN HELPERS — impulse-only segment, opposite before pivot, straight pivot search, impulse fold
 //────────────────────────────────────────
-// Multi clean: entire segment after opposite bar must be impulse-only when requireImpulseAfterOpp; straight = local high/low peak on 3 bars (mo = offset of straight candle from current bar).
-// Clean marker: same 3-bar wick pivot but all three candles must be impulse (bull or bear); segment after last opposite before pivot must be impulse-only (no bear in a bull leg — else Break marker only).
+// Multi clean: 3-bar straight wick pivot; entire segment after last opposite must be impulse-only (no bears in a bull leg → else no Multi clean, use Break marker). Oldest bar of the 3 must lie strictly after last opposite.
+// Clean marker: same 3-bar wick pivot but all three candles must be strict impulse; same segment rule as Multi.
 f_allImpulseBarsSince(dir, lastOppBarIdx) =>
     bool ok = true
     if na(lastOppBarIdx) or lastOppBarIdx >= bar_index
@@ -349,22 +346,6 @@ f_findCleanStraightOffset(dir) =>
                     break
     result
 
-// Multi clean: 3-bar pivot on highs/lows — middle candle (“candle 2”) can be any color; only wick extreme vs neighbors matters. Nearest match (smallest mo) breaks first.
-f_findMultiStraightOffset(dir) =>
-    int result = int(na)
-    int maxMo = math.min(markerLookback, bar_index - 1)
-    if maxMo >= 1
-        for mo = 1 to maxMo
-            bool pat = false
-            if dir == 1
-                pat := high[mo] > high[mo + 1] and high[mo] > high[mo - 1]
-            else
-                pat := low[mo] < low[mo + 1] and low[mo] < low[mo - 1]
-            if pat
-                result := mo
-                break
-    result
-
 // Lowest low from straight candle (offset strOff) through current bar (incl. bars between straight and now).
 f_minLowStraightToNow(strOff) =>
     float m = low[strOff]
@@ -388,6 +369,30 @@ f_pivotAfterC3Ok(dir, mo) =>
 // Multi clean only — can skip INV filter via input (Clean marker always uses f_pivotAfterC3Ok)
 f_mcmPivotAfterOk(dir, mo) =>
     mcmSkipInvalidCandleRule ? true : f_pivotAfterC3Ok(dir, mo)
+
+// Oldest candle of the 3-bar fractal (bar_index - mo - 1) must be strictly after last opposite (impulse leg only).
+f_mcmTripleOldestAfterLastOpp(lastOppBarIdx, mo) =>
+    not na(lastOppBarIdx) and (bar_index - mo - 1) > lastOppBarIdx
+
+// Multi clean: 3-bar straight wick pivot (middle high/low vs neighbors); middle may be any color. Nearest mo. Impulse-only leg from last opposite + fractal oldest after that opposite + mcm INV rule.
+f_findMultiStraightOffset(dir) =>
+    int result = int(na)
+    int maxMo = math.min(markerLookback, bar_index - 1)
+    if maxMo >= 1
+        for mo = 1 to maxMo
+            bool pat = false
+            if dir == 1
+                pat := high[mo] > high[mo + 1] and high[mo] > high[mo - 1]
+            else
+                pat := low[mo] < low[mo + 1] and low[mo] < low[mo - 1]
+            if pat
+                int straightBar = bar_index - mo
+                int lastOppM = f_lastOppBarBefore(dir, straightBar)
+                bool segOk = not na(lastOppM) and f_allImpulseBarsSince(dir, lastOppM) and f_mcmTripleOldestAfterLastOpp(lastOppM, mo) and f_mcmPivotAfterOk(dir, mo)
+                if segOk
+                    result := mo
+                    break
+    result
 
 // First bar after pivot (chronological: off mo-1, mo-2, … 0) where close takes ref (same test as mcleanBreak close vs break ref).
 f_mcmFirstConfirmOff(dir, mo, ref) =>
@@ -417,8 +422,8 @@ f_findMultiStraightOffsetConfirmFirst(dir) =>
             if pat
                 int straightBar = bar_index - mo
                 int lastOppM = f_lastOppBarBefore(dir, straightBar)
-                bool mcmSegmentOk = not na(lastOppM) and (not requireImpulseAfterOpp or f_allImpulseBarsSince(dir, lastOppM))
-                if mcmSegmentOk and f_mcmPivotAfterOk(dir, mo)
+                bool mcmSegmentOk = not na(lastOppM) and f_allImpulseBarsSince(dir, lastOppM) and f_mcmTripleOldestAfterLastOpp(lastOppM, mo) and f_mcmPivotAfterOk(dir, mo)
+                if mcmSegmentOk
                     if na(fallbackMo)
                         fallbackMo := mo
                     float ref = dir == 1 ? high[mo] : low[mo]
@@ -846,8 +851,7 @@ for d = 0 to 1
             if not na(mo)
                 int straightBar = bar_index - mo
                 int lastOppM = f_lastOppBarBefore(dir, straightBar)
-                bool mcmSegmentOk = not na(lastOppM) and (not requireImpulseAfterOpp or f_allImpulseBarsSince(dir, lastOppM))
-                if mcmSegmentOk and f_mcmPivotAfterOk(dir, mo)
+                if not na(lastOppM)
                     if dir == 1
                         array.set(mcmBreakRef, d, high[mo])
                         array.set(mcmImpulse, d, f_minLowStraightToNow(mo))
@@ -918,8 +922,8 @@ for d = 0 to 1
                     else
                         bearConfirmed := true
 
-                // Straight level must be taken by a *closed* candle (close through ref), not wick-only
-                mcleanBreak = barstate.isconfirmed and (dir == 1 ? close > array.get(mcmBreakRef, d) : close < array.get(mcmBreakRef, d))
+                // Straight level taken by *closed* strict impulse candle (close through ref), not wick-only
+                mcleanBreak = barstate.isconfirmed and (dir == 1 ? close > array.get(mcmBreakRef, d) and isStrictBull : close < array.get(mcmBreakRef, d) and isStrictBear)
 
                 bool mcmSweepOk = not mcmStrictMode or array.get(mcmExtremeTaken, d)
                 if mcmSweepOk and mcleanBreak
@@ -1407,7 +1411,7 @@ if barstate.islast
         table.cell(regionGuideTbl, 0, 3, "Clean marker", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
         table.cell(regionGuideTbl, 1, 3, "Pivot + close takes wick ref; if pivot wick rule caps zone, OB alert on zone touch only (not on close through raw wick); optional: reject if 1st bar after pattern is opposite color", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
         table.cell(regionGuideTbl, 0, 4, "Multi clean", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
-        table.cell(regionGuideTbl, 1, 4, "Separate from Break marker. After BOS: fractal + segment; (A–D) during WAIT; “Multi clean” box only after close takes ref (+ distance). Not every Break-marker bar arms Multi clean.", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
+        table.cell(regionGuideTbl, 1, 4, "After BOS: straight3-bar wick + impulse-only leg from last opposite (oldest fractal bar after that opposite); optional INV skip; close take on strict impulse bar. (A–D) map when labels on. Mixed leg → Break marker, not Multi clean.", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
         table.cell(regionGuideTbl, 0, 5, "Break marker", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
         table.cell(regionGuideTbl, 1, 5, "Own pipeline: BOS slot → opposite stack → impulse breaks ref → Break box (not Multi clean)", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
         table.cell(regionGuideTbl, 0, 6, "Mitigation", text_color=guideTxt, bgcolor=cellBg, text_size=szGuide, text_halign=text.align_left)
