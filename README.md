@@ -51,7 +51,7 @@ Same **3-bar straight wick** idea, but the **middle** candle **may** be the “w
 | Path | Description |
 |------|-------------|
 | `OrderBlockZoneIndicator.pine` | Pine v5 source — paste into TradingView **Pine Editor** → **Add to chart**. The `indicator(...)` title line shows the version (e.g. V1.4.28). |
-| `mt5/OrderBlockZone2.mq5` | MetaTrader 5 port (**v1.55** in `#property version`). **Clean** and **Multi clean** follow the same rules as Pine for straight fractal, impulse-only leg, triple-after-opposite (Multi), pivot wick zone, and strict take close. **Not** ported: Multi clean **“prefer pivot that confirms first”** (Pine input `mcmPreferConfirmFirst`). |
+| `mt5/OrderBlockZoneIndicator.mq5` | MetaTrader 5 port (**v1.55** in `#property version`). **Clean** and **Multi clean** follow the same rules as Pine for straight fractal, impulse-only leg, triple-after-opposite (Multi), pivot wick zone, and strict take close. **Not** ported: Multi clean **“prefer pivot that confirms first”** (Pine input `mcmPreferConfirmFirst`). |
 | `img/clean-marker-bullish-example.png` | Schematic: bullish clean marker (strict triple, zone, take). |
 | `img/clean-marker-bearish-example.png` | Schematic: bearish clean marker (strict triple). |
 | `img/multi-clean-bullish-example.png` | Schematic: bullish multi clean (middle may be opposite-color body if wick forms straight high). |
@@ -68,8 +68,8 @@ Same **3-bar straight wick** idea, but the **middle** candle **may** be the “w
 
 **MetaTrader 5**
 
-1. Copy `mt5/OrderBlockZone2.mq5` into your `MQL5/Indicators` folder and compile in **MetaEditor**.
-2. Attach **OrderBlockZone2** to a chart; set inputs to match how you use the Pine script (see file header comments).
+1. Copy `mt5/OrderBlockZoneIndicator.mq5` into your `MQL5/Indicators` folder and compile in **MetaEditor**.
+2. Attach **OrderBlockZoneIndicator** to a chart; set inputs to match how you use the Pine script (see file header comments).
 
 ## Requirements
 
